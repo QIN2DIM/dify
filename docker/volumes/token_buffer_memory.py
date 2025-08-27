@@ -116,10 +116,59 @@ class TokenBufferMemory:
             else:
                 prompt_messages.append(UserPromptMessage(content=message.query))
 
-            # TODO: Temporarily disable assistant multimodal recovery due to plugin compatibility issues
-            # The plugin expects string content but our multimodal recovery creates List content
-            # For now, always use string content to maintain compatibility
-            prompt_messages.append(AssistantPromptMessage(content=message.answer))
+            # Check if assistant message has files
+            assistant_files = db.session.query(MessageFile).filter(
+                MessageFile.message_id == message.id,
+                MessageFile.belongs_to == "assistant"
+            ).all()
+
+            if assistant_files:
+                assistant_prompt_message_contents: list[PromptMessageContentUnionTypes] = []
+
+                # Build File objects from assistant MessageFile records
+                for message_file in assistant_files:
+                    if message_file.upload_file_id:
+                        # Build File object using file_factory approach
+                        mapping = {
+                            "transfer_method": message_file.transfer_method,
+                            "url": message_file.url,
+                            "id": message_file.id,
+                            "type": message_file.type,
+                            "tool_file_id": message_file.upload_file_id,  # For tool files
+                        }
+                        try:
+                            from factories.file_factory import build_from_mapping
+                            file = build_from_mapping(
+                                mapping=mapping,
+                                tenant_id=app_record.tenant_id if app_record else "",
+                            )
+
+                            # Convert to prompt message content using file_manager
+                            prompt_message = file_manager.to_prompt_message_content(
+                                file,
+                                image_detail_config=ImagePromptMessageContent.DETAIL.LOW,
+                            )
+                            assistant_prompt_message_contents.append(prompt_message)
+
+                        except Exception as e:
+                            logger.warning(f"Failed to build file from assistant message_file {message_file.id}: {e}")
+                            # Fallback to text description if file building fails
+                            assistant_prompt_message_contents.append(
+                                TextPromptMessageContent(data=f"[Assistant file: {message_file.id}]")
+                            )
+
+                # Add text content if exists
+                if message.answer:
+                    # Remove markdown image links since we have proper image content
+                    text_content = re.sub(r'!\[.*?\]\(.*?\)', '', message.answer).strip()
+                    if text_content:
+                        assistant_prompt_message_contents.append(
+                            TextPromptMessageContent(data=text_content)
+                        )
+
+                prompt_messages.append(AssistantPromptMessage(content=assistant_prompt_message_contents))
+            else:
+                prompt_messages.append(AssistantPromptMessage(content=message.answer))
 
         if not prompt_messages:
             return []
